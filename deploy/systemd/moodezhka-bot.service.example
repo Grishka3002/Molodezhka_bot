@@ -1,0 +1,16 @@
+[Unit]
+Description=Moodezhka Telegram bots
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/moodezhka-bot
+EnvironmentFile=/opt/moodezhka-bot/.env
+ExecStart=/usr/bin/python3 /opt/moodezhka-bot/run_bots.py
+Restart=always
+RestartSec=10
+User=moodezhka
+
+[Install]
+WantedBy=multi-user.target
