@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import http.client
 import json
+import mimetypes
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import Any
 
 
@@ -93,6 +96,19 @@ class TelegramAPI:
     def get_me(self) -> dict[str, Any]:
         return self.request("getMe")
 
+    def get_file_path(self, file_id: str) -> str:
+        result = self.request("getFile", {"file_id": file_id})
+        return result["file_path"]
+
+    def download_file(self, file_path: str) -> bytes:
+        url = f"{self.base_url.replace('/bot', '/file/bot', 1)}/{file_path}"
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read()
+        except self._transient_errors() as error:
+            raise TelegramError("downloadFile", f"temporary connection problem: {error}") from error
+
     def send_message(
         self,
         chat_id: int,
@@ -144,6 +160,61 @@ class TelegramAPI:
             payload["reply_markup"] = reply_markup
         return self.request("sendPhoto", payload)
 
+    def send_photo_file(
+        self,
+        chat_id: int,
+        photo_path: Path,
+        caption: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "caption": caption,
+            "parse_mode": "HTML",
+        }
+        if reply_markup:
+            fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        return self._multipart_request("sendPhoto", fields, "photo", photo_path)
+
+    def _multipart_request(
+        self,
+        method: str,
+        fields: dict[str, Any],
+        file_field: str,
+        file_path: Path,
+    ) -> dict[str, Any]:
+        boundary = f"----BotBoundary{uuid.uuid4().hex}"
+        body = bytearray()
+        for name, value in fields.items():
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+            body.extend(str(value).encode("utf-8"))
+            body.extend(b"\r\n")
+        mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{file_path.name}"\r\n'.encode()
+        )
+        body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode())
+        body.extend(file_path.read_bytes())
+        body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode())
+
+        request = urllib.request.Request(
+            f"{self.base_url}/{method}",
+            data=bytes(body),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except self._transient_errors() as error:
+            raise TelegramError(method, f"temporary connection problem: {error}") from error
+        if not result.get("ok"):
+            raise TelegramError(method, result.get("description", "unknown error"))
+        return result["result"]
+
     def edit_message_media(
         self,
         chat_id: int,
@@ -165,6 +236,31 @@ class TelegramAPI:
         if reply_markup:
             payload["reply_markup"] = reply_markup
         return self.request("editMessageMedia", payload)
+
+    def edit_message_media_file(
+        self,
+        chat_id: int,
+        message_id: int,
+        photo_path: Path,
+        caption: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": str(message_id),
+            "media": json.dumps(
+                {
+                    "type": "photo",
+                    "media": "attach://photo",
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                },
+                ensure_ascii=False,
+            ),
+        }
+        if reply_markup:
+            fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        return self._multipart_request("editMessageMedia", fields, "photo", photo_path)
 
     def delete_message(self, chat_id: int, message_id: int) -> None:
         self.request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})

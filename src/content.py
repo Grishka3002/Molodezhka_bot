@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
 
 class Content:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, default_path: Path | None = None) -> None:
         self.path = path
         self._mtime: float | None = None
+        if not self.path.exists():
+            if default_path is None:
+                raise FileNotFoundError(self.path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(default_path, self.path)
         self.data = self._load()
 
     def _load(self) -> dict[str, Any]:

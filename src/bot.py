@@ -15,7 +15,8 @@ from .telegram_api import TelegramAPI, TelegramError
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTENT_PATH = ROOT / "content" / "activities.json"
+DEFAULT_CONTENT_PATH = ROOT / "content" / "activities.json"
+CONTENT_PATH = ROOT / "data" / "activities.json"
 DB_PATH = ROOT / "data" / "bot.sqlite3"
 
 
@@ -487,7 +488,11 @@ class YouthBot:
             self.show_categories(chat_id, student)
             return
 
-        rows = [[(item["title"], f"activity:{category_id}:{item['id']}")] for item in category["items"]]
+        rows = [
+            [(item["title"], f"activity:{category_id}:{item['id']}")]
+            for item in category["items"]
+            if self.activity_allowed(student, item)
+        ]
         rows.append([("Назад к активностям", "categories")])
         rows.append([("В главное меню", "main")])
         text = (
@@ -506,7 +511,7 @@ class YouthBot:
     ) -> None:
         activity = self.content.activity(category_id, activity_id)
         category = self.content.category(category_id)
-        if not activity or not category:
+        if not activity or not category or not self.activity_allowed(student, activity):
             self.show_categories(chat_id, student)
             return
 
@@ -541,7 +546,7 @@ class YouthBot:
         activity_id: str,
     ) -> None:
         activity = self.content.activity(category_id, activity_id)
-        if not activity:
+        if not activity or not self.activity_allowed(student, activity):
             self.show_categories(chat_id, student)
             return
         self.storage.add_activity_signup(student.telegram_id, category_id, activity_id)
@@ -623,7 +628,7 @@ class YouthBot:
         return self.popular_activities(student, limit)
 
     def popular_activities(self, student: Student, limit: int) -> list[tuple[str, str, str]]:
-        activities = self.activity_lookup()
+        activities = self.activity_lookup(student)
         scores: dict[tuple[str, str], int] = {}
         student_interests = set(student.interests or [])
         for row in self.storage.activity_signup_rows():
@@ -653,6 +658,8 @@ class YouthBot:
         all_items: list[tuple[str, str, str]] = []
         for category in self.content.categories:
             for activity in category.get("items", []):
+                if not self.activity_allowed(student, activity):
+                    continue
                 entry = (category["id"], activity["id"], activity["title"])
                 all_items.append(entry)
                 haystack = " ".join(
@@ -667,12 +674,23 @@ class YouthBot:
                     matches.append(entry)
         return (matches or all_items)[:limit]
 
-    def activity_lookup(self) -> dict[tuple[str, str], dict[str, Any]]:
+    def activity_lookup(self, student: Student | None = None) -> dict[tuple[str, str], dict[str, Any]]:
         return {
             (category["id"], activity["id"]): activity
             for category in self.content.categories
             for activity in category.get("items", [])
+            if student is None or self.activity_allowed(student, activity)
         }
+
+    def activity_allowed(self, student: Student, activity: dict[str, Any]) -> bool:
+        audience = activity.get("audience", "mixed")
+        if audience == "mixed" or not student.gender:
+            return True
+        if student.gender == "Мужской":
+            return audience != "female"
+        if student.gender == "Женский":
+            return audience != "male"
+        return True
 
     def show_profile(self, chat_id: int, student: Student) -> None:
         interests = ", ".join(student.interests or []) or "пока не выбрано"
@@ -710,8 +728,11 @@ class YouthBot:
     ) -> None:
         photo = (photo or "").strip()
         if photo:
-            self.render_photo(chat_id, student, photo, text, reply_markup)
-            return
+            try:
+                self.render_photo(chat_id, student, photo, text, reply_markup)
+                return
+            except (TelegramError, OSError) as error:
+                print(f"Photo could not be shown, using text screen instead: {error}")
         self.render_text(chat_id, student, text, reply_markup)
 
     def prepare_fresh_command_screen(self, chat_id: int, student: Student) -> Student:
@@ -755,8 +776,15 @@ class YouthBot:
     ) -> None:
         photo = (photo or "").strip()
         if photo:
-            self.api.send_photo(chat_id, photo, text, reply_markup)
-            return
+            try:
+                local_photo = self.local_photo_path(photo)
+                if local_photo:
+                    self.api.send_photo_file(chat_id, local_photo, text, reply_markup)
+                else:
+                    self.api.send_photo(chat_id, photo, text, reply_markup)
+                return
+            except (TelegramError, OSError) as error:
+                print(f"Photo could not be sent, using text message instead: {error}")
         self.api.send_message(chat_id, text, reply_markup)
 
     def render_photo(
@@ -767,6 +795,30 @@ class YouthBot:
         caption: str,
         reply_markup: dict[str, Any] | None = None,
     ) -> None:
+        local_photo = self.local_photo_path(photo)
+        if local_photo:
+            if student.last_bot_message_id and student.last_bot_message_kind == "photo":
+                try:
+                    self.api.edit_message_media_file(
+                        chat_id,
+                        student.last_bot_message_id,
+                        local_photo,
+                        caption,
+                        reply_markup,
+                    )
+                    return
+                except TelegramError as error:
+                    if "message is not modified" in error.description.lower():
+                        return
+            message = self.api.send_photo_file(chat_id, local_photo, caption, reply_markup)
+            self.try_delete_previous_async(chat_id, student)
+            self.storage.update_student(
+                student.telegram_id,
+                last_bot_message_id=message["message_id"],
+                last_bot_message_kind="photo",
+            )
+            return
+
         if student.last_bot_message_id and student.last_bot_message_kind == "photo":
             try:
                 self.api.edit_message_media(
@@ -788,6 +840,12 @@ class YouthBot:
             last_bot_message_id=message["message_id"],
             last_bot_message_kind="photo",
         )
+
+    def local_photo_path(self, photo: str) -> Path | None:
+        path = Path(photo)
+        if not path.is_absolute():
+            path = ROOT / path
+        return path if path.is_file() else None
 
     def try_delete_previous(self, chat_id: int, student: Student) -> None:
         if student.last_bot_message_id:
@@ -830,6 +888,6 @@ def main() -> None:
 
     api = TelegramAPI(token)
     storage = Storage(DB_PATH)
-    content = Content(CONTENT_PATH)
+    content = Content(CONTENT_PATH, DEFAULT_CONTENT_PATH)
     with RuntimeLock(ROOT / "data" / "student_bot.lock", "Основной бот"):
         YouthBot(api, storage, content).run()

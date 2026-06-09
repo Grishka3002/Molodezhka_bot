@@ -3,9 +3,11 @@ from __future__ import annotations
 import threading
 import time
 import traceback
+import uuid
+from pathlib import Path
 from typing import Any
 
-from .bot import CONTENT_PATH, DB_PATH, ROOT, clean, inline_keyboard, load_env
+from .bot import CONTENT_PATH, DB_PATH, DEFAULT_CONTENT_PATH, ROOT, clean, inline_keyboard, load_env
 from .content import Content
 from .db import Storage
 from .runtime_lock import RuntimeLock
@@ -44,6 +46,12 @@ ITEM_FIELDS = {
     "description": "Описание",
     "contact": "Контакты",
     "where": "Где и когда",
+}
+
+AUDIENCE_LABELS = {
+    "mixed": "Смешанное",
+    "male": "Мужское",
+    "female": "Женское",
 }
 
 
@@ -203,8 +211,7 @@ class AdminBot:
         elif data == "photo:intro:set":
             self.ask_for_photo(chat_id, telegram_id, {"target": "intro"})
         elif data == "photo:intro:delete":
-            self.content.data["intro"]["photo"] = ""
-            self.content.save()
+            self.clear_photo({"target": "intro"})
             self.show_intro(chat_id, message["message_id"])
         elif data.startswith("msg:"):
             key = data.split(":", 1)[1]
@@ -224,8 +231,7 @@ class AdminBot:
             if action == "set":
                 self.ask_for_photo(chat_id, telegram_id, {"target": "message", "key": key})
             elif action == "delete":
-                self.content.data.setdefault("message_photos", {}).pop(key, None)
-                self.content.save()
+                self.clear_photo({"target": "message", "key": key})
                 self.show_message(chat_id, key, message["message_id"])
         elif data.startswith("direction:"):
             self.show_direction(chat_id, int(data.split(":", 1)[1]), message["message_id"])
@@ -274,10 +280,7 @@ class AdminBot:
             if action == "set":
                 self.ask_for_photo(chat_id, telegram_id, {"target": "category", "index": index})
             elif action == "delete":
-                category = self.category_by_index(index)
-                if category:
-                    category["photo"] = ""
-                    self.content.save()
+                self.clear_photo({"target": "category", "index": index})
                 self.show_category(chat_id, index, message["message_id"])
         elif data.startswith("catdelete:"):
             self.confirm_delete_category(chat_id, int(data.split(":", 1)[1]), message["message_id"])
@@ -316,6 +319,23 @@ class AdminBot:
                 },
                 f"Введите новое значение для поля «{label}»:",
             )
+        elif data.startswith("itemaudiencemenu:"):
+            _, raw_category_index, raw_item_index = data.split(":", 2)
+            self.show_item_audience(
+                chat_id,
+                int(raw_category_index),
+                int(raw_item_index),
+                message["message_id"],
+            )
+        elif data.startswith("itemaudience:"):
+            _, raw_category_index, raw_item_index, audience = data.split(":", 3)
+            category_index = int(raw_category_index)
+            item_index = int(raw_item_index)
+            item = self.item_by_index(category_index, item_index)
+            if item and audience in AUDIENCE_LABELS:
+                item["audience"] = audience
+                self.content.save()
+            self.show_item(chat_id, category_index, item_index, message["message_id"])
         elif data.startswith("itemphoto:"):
             _, raw_category_index, raw_item_index, action = data.split(":", 3)
             category_index = int(raw_category_index)
@@ -327,10 +347,13 @@ class AdminBot:
                     {"target": "item", "category_index": category_index, "item_index": item_index},
                 )
             elif action == "delete":
-                item = self.item_by_index(category_index, item_index)
-                if item:
-                    item["photo"] = ""
-                    self.content.save()
+                self.clear_photo(
+                    {
+                        "target": "item",
+                        "category_index": category_index,
+                        "item_index": item_index,
+                    }
+                )
                 self.show_item(chat_id, category_index, item_index, message["message_id"])
         elif data.startswith("itemdelete:"):
             _, raw_category_index, raw_item_index = data.split(":", 2)
@@ -364,7 +387,12 @@ class AdminBot:
             if not photo_file_id:
                 self.send(chat_id, "Отправьте именно картинку. Чтобы отменить действие, отправьте /cancel.")
                 return
-            self.set_photo(payload, photo_file_id)
+            try:
+                photo = self.download_photo(photo_file_id)
+                self.set_photo(payload, photo)
+            except (TelegramError, OSError) as error:
+                self.send(chat_id, f"Не удалось сохранить фото: {clean(str(error))}\n\nПопробуйте отправить его ещё раз.")
+                return
             self.content.save()
             self.storage.clear_admin_session(telegram_id)
             self.send(chat_id, "Фото обновлено.")
@@ -426,12 +454,13 @@ class AdminBot:
                     "photo": "",
                     "contact": "Добавьте контакты для записи.",
                     "where": "Добавьте место, расписание или ссылку на мероприятия.",
+                    "audience": "mixed",
                 }
             )
             self.content.save()
             self.storage.clear_admin_session(telegram_id)
-            self.send(chat_id, "Объединение добавлено.")
-            self.show_items(chat_id, payload["category_index"])
+            item_index = len(category["items"]) - 1
+            self.show_item_audience(chat_id, payload["category_index"], item_index)
         elif state == "edit_item":
             item = self.item_by_index(payload["category_index"], payload["item_index"])
             if not item:
@@ -649,7 +678,8 @@ class AdminBot:
             f"<b>Описание:</b>\n{clean(item.get('description'))}\n\n"
             f"<b>Где и когда:</b>\n{clean(item.get('where'))}\n\n"
             f"<b>Контакты:</b>\n{clean(item.get('contact'))}\n\n"
-            f"<b>Фото:</b> {self.photo_status(item.get('photo'))}"
+            f"<b>Фото:</b> {self.photo_status(item.get('photo'))}\n\n"
+            f"<b>Состав:</b> {clean(AUDIENCE_LABELS.get(item.get('audience', 'mixed'), 'Смешанное'))}"
         )
         keyboard = inline_keyboard(
             [
@@ -659,11 +689,41 @@ class AdminBot:
             + [
                 [("Загрузить фото", f"itemphoto:{category_index}:{item_index}:set")],
                 [("Удалить фото", f"itemphoto:{category_index}:{item_index}:delete")],
+                [("Изменить состав", f"itemaudiencemenu:{category_index}:{item_index}")],
                 [("Удалить объединение", f"itemdelete:{category_index}:{item_index}")],
                 [("К объединениям", f"items:{category_index}")],
             ]
         )
         self.render(chat_id, text, keyboard, message_id)
+
+    def show_item_audience(
+        self,
+        chat_id: int,
+        category_index: int,
+        item_index: int,
+        message_id: int | None = None,
+    ) -> None:
+        item = self.item_by_index(category_index, item_index)
+        if not item:
+            self.show_items(chat_id, category_index, message_id)
+            return
+        current = item.get("audience", "mixed")
+        rows = [
+            [
+                (
+                    f"{'[x]' if value == current else '[ ]'} {label}",
+                    f"itemaudience:{category_index}:{item_index}:{value}",
+                )
+            ]
+            for value, label in AUDIENCE_LABELS.items()
+        ]
+        rows.append([("Назад к объединению", f"item:{category_index}:{item_index}")])
+        self.render(
+            chat_id,
+            f"<b>{clean(item['title'])}</b>\n\nВыберите состав объединения:",
+            inline_keyboard(rows),
+            message_id,
+        )
 
     def confirm_delete_category(self, chat_id: int, index: int, message_id: int | None = None) -> None:
         category = self.category_by_index(index)
@@ -771,20 +831,69 @@ class AdminBot:
         self.storage.set_admin_session(telegram_id, "set_photo", payload)
         self.send(chat_id, "Отправьте картинку одним сообщением.\n\nЧтобы отменить действие, отправьте /cancel.")
 
-    def set_photo(self, payload: dict[str, Any], file_id: str) -> None:
+    def set_photo(self, payload: dict[str, Any], photo: str) -> None:
+        self.delete_local_photo(self.photo_for_payload(payload))
         target = payload["target"]
         if target == "intro":
-            self.content.data.setdefault("intro", {})["photo"] = file_id
+            self.content.data.setdefault("intro", {})["photo"] = photo
         elif target == "message":
-            self.content.data.setdefault("message_photos", {})[payload["key"]] = file_id
+            self.content.data.setdefault("message_photos", {})[payload["key"]] = photo
         elif target == "category":
             category = self.category_by_index(payload["index"])
             if category:
-                category["photo"] = file_id
+                category["photo"] = photo
         elif target == "item":
             item = self.item_by_index(payload["category_index"], payload["item_index"])
             if item:
-                item["photo"] = file_id
+                item["photo"] = photo
+
+    def download_photo(self, file_id: str) -> str:
+        file_path = self.api.get_file_path(file_id)
+        suffix = Path(file_path).suffix.lower() or ".jpg"
+        uploads = ROOT / "data" / "uploads"
+        uploads.mkdir(parents=True, exist_ok=True)
+        destination = uploads / f"{uuid.uuid4().hex}{suffix}"
+        destination.write_bytes(self.api.download_file(file_path))
+        return destination.relative_to(ROOT).as_posix()
+
+    def photo_for_payload(self, payload: dict[str, Any]) -> str:
+        target = payload["target"]
+        if target == "intro":
+            return self.content.data.setdefault("intro", {}).get("photo", "")
+        if target == "message":
+            return self.content.data.setdefault("message_photos", {}).get(payload["key"], "")
+        if target == "category":
+            category = self.category_by_index(payload["index"])
+            return category.get("photo", "") if category else ""
+        if target == "item":
+            item = self.item_by_index(payload["category_index"], payload["item_index"])
+            return item.get("photo", "") if item else ""
+        return ""
+
+    def clear_photo(self, payload: dict[str, Any]) -> None:
+        self.delete_local_photo(self.photo_for_payload(payload))
+        target = payload["target"]
+        if target == "intro":
+            self.content.data.setdefault("intro", {})["photo"] = ""
+        elif target == "message":
+            self.content.data.setdefault("message_photos", {}).pop(payload["key"], None)
+        elif target == "category":
+            category = self.category_by_index(payload["index"])
+            if category:
+                category["photo"] = ""
+        elif target == "item":
+            item = self.item_by_index(payload["category_index"], payload["item_index"])
+            if item:
+                item["photo"] = ""
+        self.content.save()
+
+    def delete_local_photo(self, photo: str) -> None:
+        if not photo:
+            return
+        path = (ROOT / photo).resolve()
+        uploads = (ROOT / "data" / "uploads").resolve()
+        if uploads in path.parents and path.is_file():
+            path.unlink()
 
     def return_after_photo_edit(self, chat_id: int, payload: dict[str, Any]) -> None:
         target = payload["target"]
@@ -902,6 +1011,6 @@ def main() -> None:
     admin_ids = parse_admin_ids(os.getenv("ADMIN_TELEGRAM_IDS"))
     api = TelegramAPI(token)
     storage = Storage(DB_PATH)
-    content = Content(CONTENT_PATH)
+    content = Content(CONTENT_PATH, DEFAULT_CONTENT_PATH)
     with RuntimeLock(ROOT / "data" / "admin_bot.lock", "Админ-бот"):
         AdminBot(api, storage, content, admin_ids).run()
